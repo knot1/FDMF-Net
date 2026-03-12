@@ -83,7 +83,8 @@ class ISPRS_dataset(torch.utils.data.Dataset):
 
         self.data_files = [dataset_cfg.data_folder.format(id) for id in ids]
         if dataset_cfg.name == 'Potsdam':
-            dif_ids = [format_string(id) for id in ids]
+            # dif_ids = [format_string(id) for id in ids]
+            dif_ids = ids
             self.dsm_files = [dataset_cfg.dsm_folder.format(id) for id in dif_ids]
         else:
             self.dsm_files = [dataset_cfg.dsm_folder.format(id) for id in ids]

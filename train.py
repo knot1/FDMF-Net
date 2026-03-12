@@ -9,6 +9,8 @@ from skimage import io
 from utils import format_string, convert_from_color, count_sliding_window, grouper, sliding_window, CrossEntropy2d, dice_loss, \
     metrics, convert_to_color
 
+# from loss.uncertainty import uncertainty_loss
+
 logging.captureWarnings(True)
 logger = logging.getLogger(__name__)
 
@@ -29,7 +31,8 @@ def test(dataset_cfg, training_cfg, model, test_ids, all=False, test_loader=None
                        test_ids)
 
     if dataset_cfg.name == 'Potsdam':
-        dif_ids = [format_string(id) for id in test_ids]
+        # dif_ids = [format_string(id) for id in test_ids]
+        dif_ids = [id for id in test_ids]
         test_dsms = (np.asarray(io.imread(dataset_cfg.dsm_folder.format(id)), dtype='float32') for id in dif_ids)
     else:
         test_dsms = (np.asarray(io.imread(dataset_cfg.dsm_folder.format(id)), dtype='float32') for id in test_ids)
@@ -134,6 +137,8 @@ def train(dataset_cfg, training_cfg, model, optimizer, scheduler, train_loader, 
         logger.info('Train (epoch {}/{})'.format(epoch, epochs))
         model.train()
         batch_losses = []
+        total_iter = len(train_loader)
+        print_interval = max(1, total_iter // 10)
         for batch_idx, (opt, dsm, target) in enumerate(train_loader):
             opt, dsm, target = opt.cuda(), dsm.cuda(), target.cuda()
             optimizer.zero_grad()
@@ -141,6 +146,7 @@ def train(dataset_cfg, training_cfg, model, optimizer, scheduler, train_loader, 
             output, MIloss, low_MIloss = model(opt, dsm)
             loss_ce = CrossEntropy2d(output, target, weight=weights)
             loss_dice = dice_loss(output, target)
+            
             loss = loss_ce + (MIloss * training_cfg.alpha) - (low_MIloss * training_cfg.beta) + (loss_dice * training_cfg.gamma)
             loss.backward()
             optimizer.step()
@@ -149,7 +155,8 @@ def train(dataset_cfg, training_cfg, model, optimizer, scheduler, train_loader, 
                 scheduler.step()
 
             batch_losses.append(loss.item())
-
+            if (batch_idx + 1) % print_interval == 0 or (batch_idx + 1) == total_iter:
+                print(f"Iter {batch_idx+1}/{total_iter} | Loss: {loss.item():.4f}")
             del (opt, target, loss)
 
         epoch_loss = np.mean(batch_losses)

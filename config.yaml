@@ -3,8 +3,8 @@ cuda_visible_devices: [ 0 ]
 training_model: "Baseline"
 training_dataset: "WHU"
 seed: 42
-#folder: "/public/fysun/Multimodal/Modal-Fusion/Dataset"  # your dataset path
-
+# folder: "/home/wsj/wsjdataset/Vaihingen_unzip/ISPRS_semantic_labeling_Vaihingen.zip"  # your dataset path
+folder: "/home/wsj/wsjdataset/OpenDataLab_Potsdam/raw"  # your dataset path
 hydra:
   run:
     dir: "./${training_model}_${training_dataset}_${seed}/${now:%Y-%m-%d_%H-%M-%S}"
@@ -22,13 +22,13 @@ model:
   num_layers: 1
   backbone: "mit_b4"
   decoder_embed_dim: 512
-  pretrained_backbone: "${folder}/pretrained/mit_b4.pth"
+  pretrained_backbone: "/home/wsj/RGBX_Semantic_Segmentation/pretrained/segformer/mit_b4.pth"
   bn_eps: 0.01
   bn_momentum: 0.01
 
 training:
   epochs: 100
-  save_epoch: 100
+  save_epoch: 1
   batch_size: 10
   learning_rate: 0.01
   weight_decay: 0.0005
@@ -50,7 +50,7 @@ dataset:
       labels: [ "roads", "buildings", "low veg.", "trees", "cars", "clutter" ]
       n_classes: 6
       stride_size: 32
-      main_folder: "${folder}/Vaihingen"
+      main_folder: "${folder}/"
       data_folder: "${.main_folder}/top/top_mosaic_09cm_area{}.tif"
       dsm_folder: "${.main_folder}/dsm/dsm_09cm_matching_area{}.tif"
       label_folder: "${.main_folder}/gts_for_participants/top_mosaic_09cm_area{}.tif"
@@ -71,7 +71,7 @@ dataset:
       labels: [ "roads", "buildings", "low veg.", "trees", "cars", "clutter" ]
       n_classes: 6
       stride_size: 128
-      main_folder: "${folder}/Potsdam/"
+      main_folder: "${folder}/Potsdam"
       data_folder: "${.main_folder}/4_Ortho_RGBIR/top_potsdam_{}_RGBIR.tif"
       dsm_folder: "${.main_folder}/1_DSM_normalisation/dsm_potsdam_{}_normalized_lastools.jpg"
       label_folder: "${.main_folder}/5_Labels_for_participants/top_potsdam_{}_label.tif"

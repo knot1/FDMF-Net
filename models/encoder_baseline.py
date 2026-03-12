@@ -5,16 +5,10 @@ from functools import partial
 import torch
 import torch.nn as nn
 from timm.models.layers import DropPath, to_2tuple, trunc_normal_
-from collections import OrderedDict
 from einops import rearrange
-
-from .frequency_modules import FrequencyModule, SpatialAttention
-from .attention import CrossAttention, SelfAttention, CrossAttentionBlock, SelfAttentionBlock
-from .club import CLUBMean
-from .mine import MINEMean
-from .cfi import CrossFrequencyInteraction
-
-
+# from .acfm import AdaptiveCrossFrequencyModule
+from .cmsg import CrossModalStructureGuidance
+# from .uaf import UncertaintyAwareFusion
 class DWConv(nn.Module):
     def __init__(self, dim=768):
         super(DWConv, self).__init__()
@@ -25,7 +19,6 @@ class DWConv(nn.Module):
         x = x.permute(0, 2, 1).reshape(B, C, H, W).contiguous()
         x = self.dwconv(x)
         x = x.flatten(2).transpose(1, 2)
-
         return x
 
 
@@ -77,7 +70,6 @@ class Attention(nn.Module):
         head_dim = dim // num_heads
         self.scale = qk_scale or head_dim ** -0.5
 
-        # Linear embedding
         self.q = nn.Linear(dim, dim, bias=qkv_bias)
         self.kv = nn.Linear(dim, dim * 2, bias=qkv_bias)
         self.attn_drop = nn.Dropout(attn_drop)
@@ -108,7 +100,6 @@ class Attention(nn.Module):
 
     def forward(self, x, H, W):
         B, N, C = x.shape
-        # B N C -> B N num_head C//num_head -> B C//num_head N num_heads
         q = self.q(x).reshape(B, N, self.num_heads, C // self.num_heads).permute(0, 2, 1, 3)
 
         if self.sr_ratio > 1:
@@ -118,6 +109,7 @@ class Attention(nn.Module):
             kv = self.kv(x_).reshape(B, -1, 2, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
         else:
             kv = self.kv(x).reshape(B, -1, 2, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
+
         k, v = kv[0], kv[1]
 
         attn = (q @ k.transpose(-2, -1)) * self.scale
@@ -127,7 +119,6 @@ class Attention(nn.Module):
         x = (attn @ v).transpose(1, 2).reshape(B, N, C)
         x = self.proj(x)
         x = self.proj_drop(x)
-
         return x
 
 
@@ -140,7 +131,6 @@ class Block(nn.Module):
             dim,
             num_heads=num_heads, qkv_bias=qkv_bias, qk_scale=qk_scale,
             attn_drop=attn_drop, proj_drop=drop, sr_ratio=sr_ratio)
-        # NOTE: drop path for stochastic depth, we shall see if this is better than dropout here
         self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
         self.norm2 = norm_layer(dim)
         mlp_hidden_dim = int(dim * mlp_ratio)
@@ -166,7 +156,6 @@ class Block(nn.Module):
     def forward(self, x, H, W):
         x = x + self.drop_path(self.attn(self.norm1(x), H, W))
         x = x + self.drop_path(self.mlp(self.norm2(x), H, W))
-
         return x
 
 
@@ -202,92 +191,29 @@ class OverlapPatchEmbed(nn.Module):
                 m.bias.data.zero_()
 
     def forward(self, x):
-        # B C H W
         x = self.proj(x)
         _, _, H, W = x.shape
         x = x.flatten(2).transpose(1, 2)
-        # B H*W/16 C
         x = self.norm(x)
-
         return x, H, W
 
 
-class ConcatFusion(nn.Module):
-    def __init__(self, input_dim=512, output_dim=512):
-        super(ConcatFusion, self).__init__()
-        self.conv_out = nn.Conv2d(input_dim * 2, output_dim, kernel_size=1, stride=1)
-
-    def forward(self, x, y):
-        output = torch.cat((x, y), dim=1)
-        output = self.conv_out(output)
-        return output
-
-
-class FrequencySpaticalFusion(nn.Module):
-    def __init__(self, dim, reduction=4):
-        super(FrequencySpaticalFusion, self).__init__()
-
-        self.highSA = SpatialAttention(reduction=reduction)
-        self.lowSA = SpatialAttention(reduction=reduction)
-
-        self.spatial_gate = nn.Conv2d(dim, 1, kernel_size=1)
-
-    def forward(self, x, x_high, x_low):
-        high_weight = self.highSA(x, x_high)
-        low_weight = self.lowSA(x, x_low)
-
-        x_high = x + high_weight * x_high
-        x_low = x + low_weight * x_low
-
-        gate_map = torch.sigmoid(self.spatial_gate(x))
-        out = gate_map * x_high + (1 - gate_map) * x_low
-
-        return x_high, x_low, out
-
-
-class Fusion(nn.Module):
-    def __init__(self, model_dim=512, num_heads=8, mlp_ratios=4., qkv_bias=False, qk_scale=None, drop=0., attn_drop=0.,
-                 drop_path=0., norm_layer=nn.LayerNorm):
-        super(Fusion, self).__init__()
-        self.concat_fusion = ConcatFusion(input_dim=model_dim, output_dim=model_dim)
-
-        self.Low2HighCross_x = CrossAttentionBlock(dim=model_dim, num_heads=num_heads, mlp_ratio=mlp_ratios,
-                                                   qkv_bias=qkv_bias, qk_scale=qk_scale, drop=drop, attn_drop=attn_drop,
-                                                   drop_path=drop_path, norm_layer=norm_layer)
-        self.Low2HighCross_y = CrossAttentionBlock(dim=model_dim, num_heads=num_heads, mlp_ratio=mlp_ratios,
-                                                   qkv_bias=qkv_bias, qk_scale=qk_scale, drop=drop, attn_drop=attn_drop,
-                                                   drop_path=drop_path, norm_layer=norm_layer)
-
-        self.LowSelf_x = SelfAttentionBlock(dim=model_dim, num_heads=num_heads, mlp_ratio=mlp_ratios,
-                                             qkv_bias=qkv_bias, qk_scale=qk_scale, drop=drop, attn_drop=attn_drop,
-                                             drop_path=drop_path, norm_layer=norm_layer)
-
-        self.conv = nn.Sequential(
-            nn.Conv2d(model_dim * 2, model_dim, kernel_size=3, stride=1, padding=1, bias=True),
-            nn.BatchNorm2d(model_dim),
+class SimpleFusion(nn.Module):
+    """
+    Baseline fusion (no ASD / no LFGF / no CFI):
+    concat(rgb_feat, extra_feat) -> 1x1 conv -> fused_feat
+    """
+    def __init__(self, c: int):
+        super().__init__()
+        self.proj = nn.Sequential(
+            nn.Conv2d(c * 2, c, kernel_size=1, bias=False),
+            nn.BatchNorm2d(c),
             nn.ReLU(inplace=True),
-            nn.Conv2d(model_dim, model_dim, kernel_size=1, stride=1),
         )
 
-    def forward(self, x_high, x_low, y_high, y_low):
-        B, C, H, W = x_high.shape
-        low = self.concat_fusion(x_low, y_low)
-
-        low = rearrange(low, 'b c h w -> b (h w) c')
-        x_high = rearrange(x_high, 'b c h w -> b (h w) c')
-        y_high = rearrange(y_high, 'b c h w -> b (h w) c')
-
-        low = self.LowSelf_x(low, H, W)
-
-        x_high = self.Low2HighCross_x(low, x_high, H, W)
-        y_high = self.Low2HighCross_y(low, y_high, H, W)
-
-        x_high = rearrange(x_high, 'b (h w) c -> b c h w', h=H, w=W)
-        y_high = rearrange(y_high, 'b (h w) c -> b c h w', h=H, w=W)
-
-        x_fused = self.conv(torch.cat((x_high, y_high), dim=1))
-
-        return x_fused
+    def forward(self, x_rgb: torch.Tensor, x_e: torch.Tensor) -> torch.Tensor:
+        x = torch.cat([x_rgb, x_e], dim=1)
+        return self.proj(x)
 
 
 class RGBXTransformer(nn.Module):
@@ -303,7 +229,7 @@ class RGBXTransformer(nn.Module):
         else:
             raise ValueError('in_chans should not be None')
 
-        # patch_embed
+        # patch_embed (rgb)
         self.patch_embed1 = OverlapPatchEmbed(img_size=img_size, patch_size=7, stride=4, in_chans=self.in_chans[0],
                                               embed_dim=embed_dims[0])
         self.patch_embed2 = OverlapPatchEmbed(img_size=img_size // 4, patch_size=3, stride=2, in_chans=embed_dims[0],
@@ -313,6 +239,7 @@ class RGBXTransformer(nn.Module):
         self.patch_embed4 = OverlapPatchEmbed(img_size=img_size // 16, patch_size=3, stride=2, in_chans=embed_dims[2],
                                               embed_dim=embed_dims[3])
 
+        # patch_embed (extra)
         self.extra_patch_embed1 = OverlapPatchEmbed(img_size=img_size, patch_size=7, stride=4,
                                                     in_chans=self.in_chans[1],
                                                     embed_dim=embed_dims[0])
@@ -325,9 +252,19 @@ class RGBXTransformer(nn.Module):
         self.extra_patch_embed4 = OverlapPatchEmbed(img_size=img_size // 16, patch_size=3, stride=2,
                                                     in_chans=embed_dims[2],
                                                     embed_dim=embed_dims[3])
-
-        # transformer encoder
-        dpr = [x.item() for x in torch.linspace(0, drop_path_rate, sum(depths))]  # stochastic depth decay rule
+        # self.acfm4 = AdaptiveCrossFrequencyModule(channels=embed_dims[3], low_radius=0.35)
+        
+        self.cmsg1 = CrossModalStructureGuidance(embed_dims[0])
+        self.cmsg2 = CrossModalStructureGuidance(embed_dims[1])
+        self.cmsg3 = CrossModalStructureGuidance(embed_dims[2])
+        self.cmsg4 = CrossModalStructureGuidance(embed_dims[3])
+        
+        # self.uaf1 = UncertaintyAwareFusion(embed_dims[0])
+        # self.uaf2 = UncertaintyAwareFusion(embed_dims[1])
+        # self.uaf3 = UncertaintyAwareFusion(embed_dims[2])
+        # self.uaf4 = UncertaintyAwareFusion(embed_dims[3])
+        # transformer encoder blocks
+        dpr = [x.item() for x in torch.linspace(0, drop_path_rate, sum(depths))]
         cur = 0
 
         self.block1 = nn.ModuleList([Block(
@@ -344,17 +281,9 @@ class RGBXTransformer(nn.Module):
             for i in range(depths[0])])
         self.extra_norm1 = norm_layer(embed_dims[0])
 
-        self.frequency1 = FrequencyModule(dim=embed_dims[0])
-        self.extra_frequency1 = FrequencyModule(dim=embed_dims[0])
-
-        self.FSfusion1 = FrequencySpaticalFusion(dim=embed_dims[0])
-        self.extra_FSfusion1 = FrequencySpaticalFusion(dim=embed_dims[0])
+        self.fuse1 = SimpleFusion(c=embed_dims[0])
 
         cur += depths[0]
-
-        self.fusion1 = Fusion(model_dim=embed_dims[0], num_heads=num_heads[0], mlp_ratios=mlp_ratios[0],
-                              qkv_bias=qkv_bias, qk_scale=qk_scale, drop=drop_rate, attn_drop=attn_drop_rate,
-                              drop_path=dpr[cur], norm_layer=norm_layer)
 
         self.block2 = nn.ModuleList([Block(
             dim=embed_dims[1], num_heads=num_heads[1], mlp_ratio=mlp_ratios[1], qkv_bias=qkv_bias, qk_scale=qk_scale,
@@ -370,17 +299,9 @@ class RGBXTransformer(nn.Module):
             for i in range(depths[1])])
         self.extra_norm2 = norm_layer(embed_dims[1])
 
-        self.frequency2 = FrequencyModule(dim=embed_dims[1])
-        self.extra_frequency2 = FrequencyModule(dim=embed_dims[1])
-
-        self.FSfusion2 = FrequencySpaticalFusion(dim=embed_dims[1])
-        self.extra_FSfusion2 = FrequencySpaticalFusion(dim=embed_dims[1])
+        self.fuse2 = SimpleFusion(c=embed_dims[1])
 
         cur += depths[1]
-
-        self.fusion2 = Fusion(model_dim=embed_dims[1], num_heads=num_heads[1], mlp_ratios=mlp_ratios[1],
-                              qkv_bias=qkv_bias, qk_scale=qk_scale, drop=drop_rate, attn_drop=attn_drop_rate,
-                              drop_path=dpr[cur], norm_layer=norm_layer)
 
         self.block3 = nn.ModuleList([Block(
             dim=embed_dims[2], num_heads=num_heads[2], mlp_ratio=mlp_ratios[2], qkv_bias=qkv_bias, qk_scale=qk_scale,
@@ -396,17 +317,9 @@ class RGBXTransformer(nn.Module):
             for i in range(depths[2])])
         self.extra_norm3 = norm_layer(embed_dims[2])
 
-        self.frequency3 = FrequencyModule(dim=embed_dims[2])
-        self.extra_frequency3 = FrequencyModule(dim=embed_dims[2])
-
-        self.FSfusion3 = FrequencySpaticalFusion(dim=embed_dims[2])
-        self.extra_FSfusion3 = FrequencySpaticalFusion(dim=embed_dims[2])
+        self.fuse3 = SimpleFusion(c=embed_dims[2])
 
         cur += depths[2]
-
-        self.fusion3 = Fusion(model_dim=embed_dims[2], num_heads=num_heads[2], mlp_ratios=mlp_ratios[2],
-                              qkv_bias=qkv_bias, qk_scale=qk_scale, drop=drop_rate, attn_drop=attn_drop_rate,
-                              drop_path=dpr[cur], norm_layer=norm_layer)
 
         self.block4 = nn.ModuleList([Block(
             dim=embed_dims[3], num_heads=num_heads[3], mlp_ratio=mlp_ratios[3], qkv_bias=qkv_bias, qk_scale=qk_scale,
@@ -422,24 +335,7 @@ class RGBXTransformer(nn.Module):
             for i in range(depths[3])])
         self.extra_norm4 = norm_layer(embed_dims[3])
 
-        self.frequency4 = FrequencyModule(dim=embed_dims[3])
-        self.extra_frequency4 = FrequencyModule(dim=embed_dims[3])
-
-        self.FSfusion4 = FrequencySpaticalFusion(dim=embed_dims[3])
-        self.extra_FSfusion4 = FrequencySpaticalFusion(dim=embed_dims[3])
-
-        cur += depths[3]
-
-        self.fusion4 = Fusion(model_dim=embed_dims[3], num_heads=num_heads[3], mlp_ratios=mlp_ratios[3],
-                              qkv_bias=qkv_bias, qk_scale=qk_scale, drop=drop_rate, attn_drop=attn_drop_rate,
-                              drop_path=dpr[cur - 1], norm_layer=norm_layer)
-
-        # >>> only stage-4 CFI (after ASD)
-        self.cfi4 = CrossFrequencyInteraction(dim=embed_dims[3])
-        self.CLUB = CLUBMean(x_dim=embed_dims[3], y_dim=embed_dims[3])
-        self.extra_CLUB = CLUBMean(x_dim=embed_dims[3], y_dim=embed_dims[3])
-
-        self.MINE = MINEMean(dim=embed_dims[3], hidden_size=embed_dims[3])
+        self.fuse4 = SimpleFusion(c=embed_dims[3])
 
         self.apply(self._init_weights)
 
@@ -465,115 +361,109 @@ class RGBXTransformer(nn.Module):
             raise TypeError('pretrained must be a str or None')
 
     def forward_features(self, x_rgb, x_e):
-        """
-        x_rgb: B x N x H x W
-        """
         B = x_rgb.shape[0]
         outs_semantic = []
 
-        ########################### Stage 1 ###########################
-        x_rgb, H, W = self.patch_embed1(x_rgb)  # [B, embed_dims[0], H/4, W/4]
-        x_e, _, _ = self.extra_patch_embed1(x_e)  # [B, embed_dims[0], H/4, W/4]
-        for i, blk in enumerate(self.block1):
+        # Stage 1
+        x_rgb, H, W = self.patch_embed1(x_rgb)
+        x_e, _, _ = self.extra_patch_embed1(x_e)
+        for blk in self.block1:
             x_rgb = blk(x_rgb, H, W)
-        for i, blk in enumerate(self.extra_block1):
+        for blk in self.extra_block1:
             x_e = blk(x_e, H, W)
         x_rgb = self.norm1(x_rgb)
         x_e = self.extra_norm1(x_e)
-
         x_rgb = x_rgb.reshape(B, H, W, -1).permute(0, 3, 1, 2).contiguous()
         x_e = x_e.reshape(B, H, W, -1).permute(0, 3, 1, 2).contiguous()
+        x_rgb = self.cmsg1(x_rgb, x_e)
 
-        rgb_high, rgb_low = self.frequency1(x_rgb)
-        e_high, e_low = self.extra_frequency1(x_e)
-        rgb_high_enhanced, rgb_low_enhanced, x_rgb = self.FSfusion1(x_rgb, rgb_high, rgb_low)
-        e_high_enhanced, e_low_enhanced, x_e = self.extra_FSfusion1(x_e, e_high, e_low)
+        # outs_semantic.append(self.uaf1(x_rgb, x_e))
 
-        x_fused = self.fusion1(rgb_high_enhanced, rgb_low_enhanced, e_high_enhanced, e_low_enhanced)
+        # fused = self.uaf1(x_rgb, x_e)
+        # if isinstance(fused, (tuple, list)):
+        #     fused = fused[0]
+        # outs_semantic.append(fused)
 
-        outs_semantic.append(x_fused)
+        outs_semantic.append(self.fuse1(x_rgb, x_e))
 
-        ########################### Stage 2 ###########################
-        x_rgb, H, W = self.patch_embed2(x_rgb)  # [B, embed_dims[1], H/8, W/8]
-        x_e, _, _ = self.extra_patch_embed2(x_e)  # [B, embed_dims[1], H/8, W/8]
-        for i, blk in enumerate(self.block2):
+        # Stage 2
+        x_rgb, H, W = self.patch_embed2(x_rgb)
+        x_e, _, _ = self.extra_patch_embed2(x_e)
+        for blk in self.block2:
             x_rgb = blk(x_rgb, H, W)
-        for i, blk in enumerate(self.extra_block2):
+        for blk in self.extra_block2:
             x_e = blk(x_e, H, W)
         x_rgb = self.norm2(x_rgb)
         x_e = self.extra_norm2(x_e)
-
         x_rgb = x_rgb.reshape(B, H, W, -1).permute(0, 3, 1, 2).contiguous()
         x_e = x_e.reshape(B, H, W, -1).permute(0, 3, 1, 2).contiguous()
+        x_rgb = self.cmsg2(x_rgb, x_e)
+        # outs_semantic.append(self.uaf2(x_rgb, x_e))
 
-        rgb_high, rgb_low = self.frequency2(x_rgb)
-        e_high, e_low = self.extra_frequency2(x_e)
-        rgb_high_enhanced, rgb_low_enhanced, x_rgb = self.FSfusion2(x_rgb, rgb_high, rgb_low)
-        e_high_enhanced, e_low_enhanced, x_e = self.extra_FSfusion2(x_e, e_high, e_low)
+        # fused = self.uaf2(x_rgb, x_e)
+        # if isinstance(fused, (tuple, list)):
+        #     fused = fused[0]
+        # outs_semantic.append(fused)
 
-        x_fused = self.fusion2(rgb_high_enhanced, rgb_low_enhanced, e_high_enhanced, e_low_enhanced)
+        outs_semantic.append(self.fuse2(x_rgb, x_e))
 
-        outs_semantic.append(x_fused)
-
-        ########################### Stage 3 ###########################
-        x_rgb, H, W = self.patch_embed3(x_rgb)  # [B, embed_dims[2], H/16, W/16]
-        x_e, _, _ = self.extra_patch_embed3(x_e)  # [B, embed_dims[2], H/16, W/16]
-        for i, blk in enumerate(self.block3):
+        # Stage 3
+        x_rgb, H, W = self.patch_embed3(x_rgb)
+        x_e, _, _ = self.extra_patch_embed3(x_e)
+        for blk in self.block3:
             x_rgb = blk(x_rgb, H, W)
-        for i, blk in enumerate(self.extra_block3):
+        for blk in self.extra_block3:
             x_e = blk(x_e, H, W)
         x_rgb = self.norm3(x_rgb)
         x_e = self.extra_norm3(x_e)
-
         x_rgb = x_rgb.reshape(B, H, W, -1).permute(0, 3, 1, 2).contiguous()
         x_e = x_e.reshape(B, H, W, -1).permute(0, 3, 1, 2).contiguous()
+        x_rgb = self.cmsg3(x_rgb, x_e)
+        # outs_semantic.append(self.uaf3(x_rgb, x_e))
 
-        rgb_high, rgb_low = self.frequency3(x_rgb)
-        e_high, e_low = self.extra_frequency3(x_e)
-        rgb_high_enhanced, rgb_low_enhanced, x_rgb = self.FSfusion3(x_rgb, rgb_high, rgb_low)
-        e_high_enhanced, e_low_enhanced, x_e = self.extra_FSfusion3(x_e, e_high, e_low)
+        # fused = self.uaf3(x_rgb, x_e)
+        # if isinstance(fused, (tuple, list)):
+        #     fused = fused[0]
+        # outs_semantic.append(fused)
 
-        x_fused = self.fusion3(rgb_high_enhanced, rgb_low_enhanced, e_high_enhanced, e_low_enhanced)
+        outs_semantic.append(self.fuse3(x_rgb, x_e))
 
-        outs_semantic.append(x_fused)
-
-        ########################### Stage 4 ###########################
-        x_rgb, H, W = self.patch_embed4(x_rgb)  # [B, embed_dims[3], H/32, W/32]
-        x_e, _, _ = self.extra_patch_embed4(x_e)  # [B, embed_dims[3], H/32, W/32]
-        for i, blk in enumerate(self.block4):
+        # Stage 4
+        x_rgb, H, W = self.patch_embed4(x_rgb)
+        x_e, _, _ = self.extra_patch_embed4(x_e)
+        for blk in self.block4:
             x_rgb = blk(x_rgb, H, W)
-        for i, blk in enumerate(self.extra_block4):
+        for blk in self.extra_block4:
             x_e = blk(x_e, H, W)
         x_rgb = self.norm4(x_rgb)
         x_e = self.extra_norm4(x_e)
-
         x_rgb = x_rgb.reshape(B, H, W, -1).permute(0, 3, 1, 2).contiguous()
         x_e = x_e.reshape(B, H, W, -1).permute(0, 3, 1, 2).contiguous()
-
-        rgb_high, rgb_low = self.frequency4(x_rgb)
-        e_high, e_low = self.extra_frequency4(x_e)
-        rgb_high_enhanced, rgb_low_enhanced, x_rgb = self.FSfusion4(x_rgb, rgb_high, rgb_low)
-        e_high_enhanced, e_low_enhanced, x_e = self.extra_FSfusion4(x_e, e_high, e_low)
-
+        x_rgb = self.cmsg4(x_rgb, x_e)
+        # x_rgb = self.acfm4(x_rgb, x_e)  # inject DSM freq info into RGB (stage4 only)
         
+        # outs_semantic.append(self.uaf4(x_rgb, x_e))
+        # fused = self.uaf4(x_rgb, x_e)
+        # if isinstance(fused, (tuple, list)):
+        #     fused = fused[0]
+        # outs_semantic.append(fused)
 
-        rgb_MIloss = self.CLUB(rgb_high_enhanced, rgb_low_enhanced)
-        rgb_MIloss_est = self.CLUB.learning_loss(rgb_high_enhanced, rgb_low_enhanced)
-        e_MIloss = self.extra_CLUB(e_high_enhanced, e_low_enhanced)
-        e_MIloss_est = self.extra_CLUB.learning_loss(e_high_enhanced, e_low_enhanced)
-        MIloss = rgb_MIloss + rgb_MIloss_est + e_MIloss + e_MIloss_est
+        outs_semantic.append(self.fuse4(x_rgb, x_e))
 
-        low_MIloss = self.MINE(rgb_low_enhanced, e_low_enhanced)
-        
-        # Cross-Frequency Interaction (after ASD) - stage 4 only
-        rgb_low_enhanced, rgb_high_enhanced, e_low_enhanced, e_high_enhanced = self.cfi4(
-            rgb_low_enhanced, rgb_high_enhanced, e_low_enhanced, e_high_enhanced
-        )
 
-        x_fused = self.fusion4(rgb_high_enhanced, rgb_low_enhanced, e_high_enhanced, e_low_enhanced)
+        # keep interface: return (outs, MIloss, low_MIloss)
+        # device = outs_semantic[-1].device
+        # MIloss = torch.zeros([], device=device)
+        # low_MIloss = torch.zeros([], device=device)
+        # return outs_semantic, MIloss, low_MIloss
+        last = outs_semantic[-1]
+        if isinstance(last, (tuple, list)):
+            last = last[0]
+        device = last.device
 
-        outs_semantic.append(x_fused)
-
+        # 建议用 shape [1]，避免 DataParallel gather scalar 警告
+        MIloss = last.new_zeros(1)
+        low_MIloss = last.new_zeros(1)
         return outs_semantic, MIloss, low_MIloss
 
     def forward(self, x_rgb, x_e):
@@ -582,7 +472,6 @@ class RGBXTransformer(nn.Module):
 
 
 def load_dualpath_model(model, model_file, in_chans):
-    # load raw state_dict
     t0 = time.time()
     if isinstance(model_file, str):
         raw_state_dict = torch.load(model_file, map_location=torch.device('cpu'))
@@ -610,7 +499,6 @@ def load_dualpath_model(model, model_file, in_chans):
             state_dict[k.replace('norm', 'extra_norm')] = v
 
     t_io = time.time()
-
     msg = model.load_state_dict(state_dict, strict=False)
     del state_dict
 
