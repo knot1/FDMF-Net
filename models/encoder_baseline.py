@@ -1,14 +1,128 @@
 import math
 import time
 from functools import partial
-
+import torch.nn.functional as F
 import torch
 import torch.nn as nn
 from timm.models.layers import DropPath, to_2tuple, trunc_normal_
 from einops import rearrange
-# from .acfm import AdaptiveCrossFrequencyModule
+from .acfm import AdaptiveCrossFrequencyModule
 from .cmsg import CrossModalStructureGuidance
-# from .uaf import UncertaintyAwareFusion
+from .uaf import UncertaintyAwareFusion
+
+# === 修复后的可视化函数 ===
+import matplotlib.pyplot as plt
+import torch_dct as DCT
+import os
+
+def visualize_acfm_effect(rgb, dsm, acfm_module, save_dir="./vis_results"):
+    os.makedirs(save_dir, exist_ok=True)
+    # 1. 原始特征的频域振幅差（ACFM前）
+    freq_rgb_ori = DCT.dct_2d(rgb, norm='ortho')
+    freq_dsm_ori = DCT.dct_2d(dsm, norm='ortho')
+    amp_diff_ori = torch.abs(freq_rgb_ori - freq_dsm_ori).mean(dim=1, keepdim=True)
+    
+    # 2. ACFM处理后的振幅差
+    rgb_freq = acfm_module.freq_transform(rgb)
+    dsm_freq = acfm_module.freq_transform(dsm)
+    freq_rgb_new = DCT.dct_2d(rgb_freq, norm='ortho')
+    freq_dsm_new = DCT.dct_2d(dsm_freq, norm='ortho')
+    amp_diff_new = torch.abs(freq_rgb_new - freq_dsm_new).mean(dim=1, keepdim=True)
+    
+    # 3. 门控权重可视化（g_low/g_high）
+    g = torch.sigmoid(acfm_module.gate(rgb))  # [B,2,1,1]
+    g_low = g[:,0].mean().item()
+    g_high = g[:,1].mean().item()
+    
+    # 4. 画图对比（关键修复：detach() 脱离计算图）
+    plt.figure(figsize=(10,4))
+    # 原始振幅差
+    plt.subplot(1,2,1)
+    plt.imshow(amp_diff_ori[0,0].detach().cpu().numpy(), cmap='viridis')  # 修复处
+    plt.title(f"Before ACFM (g_low={g_low:.2f}, g_high={g_high:.2f})")
+    plt.axis('off')
+    # ACFM后振幅差
+    plt.subplot(1,2,2)
+    plt.imshow(amp_diff_new[0,0].detach().cpu().numpy(), cmap='viridis')  # 修复处
+    plt.title("After ACFM (Reduced Inter-modal Difference)")
+    plt.axis('off')
+    plt.savefig(os.path.join(save_dir, "acfm_amp_diff.png"), dpi=300, bbox_inches='tight')
+    plt.close()
+
+def visualize_cmsg_effect(rgb, dsm, cmsg_module, save_dir="./vis_results"):
+    os.makedirs(save_dir, exist_ok=True)
+    # 1. 提取DSM高频结构
+    blur = cmsg_module.dsm_blur(dsm)
+    structure = dsm - blur
+    structure_refine = cmsg_module.structure_refine(structure)
+    
+    # 2. 注意力权重
+    a = cmsg_module.attn(torch.cat([rgb, structure_refine], dim=1))
+    
+    # 3. 可视化（关键修复：detach()）
+    plt.figure(figsize=(12,3))
+    # DSM原图
+    plt.subplot(1,4,1)
+    plt.imshow(dsm[0,0].detach().cpu().numpy(), cmap='gray')  # 修复处
+    plt.title("DSM Original")
+    plt.axis('off')
+    # DSM高频结构
+    plt.subplot(1,4,2)
+    plt.imshow(structure_refine[0,0].detach().cpu().numpy(), cmap='gray')  # 修复处
+    plt.title("DSM High-pass Structure")
+    plt.axis('off')
+    # 注意力权重
+    plt.subplot(1,4,3)
+    plt.imshow(a[0,0].detach().cpu().numpy(), cmap='jet')  # 修复处
+    plt.title("CMSG Attention Weight")
+    plt.axis('off')
+    # 引导后的RGB
+    guided_rgb = rgb + rgb * a
+    plt.subplot(1,4,4)
+    plt.imshow(guided_rgb[0,0].detach().cpu().numpy(), cmap='gray')  # 修复处
+    plt.title("Guided RGB")
+    plt.axis('off')
+    plt.savefig(os.path.join(save_dir, "cmsg_structure.png"), dpi=300, bbox_inches='tight')
+    plt.close()
+
+def visualize_uaf_effect(rgb, dsm, uaf_module, save_dir="./vis_results"):
+    os.makedirs(save_dir, exist_ok=True)
+    # 1. 置信度分数和权重
+    rgb_score = uaf_module.rgb_conf(rgb)
+    dsm_score = uaf_module.dsm_conf(dsm)
+    scores = torch.cat([rgb_score, dsm_score], dim=1)
+    weights = F.softmax(scores / uaf_module.temperature, dim=1)
+    w_rgb = weights[:,0:1]
+    w_dsm = weights[:,1:2]
+    
+    # 2. 融合特征
+    fusion = w_rgb * rgb + w_dsm * dsm
+    
+    # 3. 可视化（关键修复：detach()）
+    plt.figure(figsize=(12,3))
+    # RGB置信度
+    plt.subplot(1,4,1)
+    plt.imshow(w_rgb[0,0].detach().cpu().numpy(), cmap='jet')  # 修复处
+    plt.title("RGB Confidence Weight")
+    plt.axis('off')
+    # DSM置信度
+    plt.subplot(1,4,2)
+    plt.imshow(w_dsm[0,0].detach().cpu().numpy(), cmap='jet')  # 修复处
+    plt.title("DSM Confidence Weight")
+    plt.axis('off')
+    # 原始RGB（模糊区）
+    plt.subplot(1,4,3)
+    plt.imshow(rgb[0,0].detach().cpu().numpy(), cmap='gray')  # 修复处
+    plt.title("Original RGB (Blurred)")
+    plt.axis('off')
+    # 融合后特征
+    plt.subplot(1,4,4)
+    plt.imshow(fusion[0,0].detach().cpu().numpy(), cmap='gray')  # 修复处
+    plt.title("UAF Fusion (Sharpened)")
+    plt.axis('off')
+    plt.savefig(os.path.join(save_dir, "uaf_confidence.png"), dpi=300, bbox_inches='tight')
+    plt.close()
+
 class DWConv(nn.Module):
     def __init__(self, dim=768):
         super(DWConv, self).__init__()
@@ -254,15 +368,18 @@ class RGBXTransformer(nn.Module):
                                                     embed_dim=embed_dims[3])
         # self.acfm4 = AdaptiveCrossFrequencyModule(channels=embed_dims[3], low_radius=0.35)
         
-        self.cmsg1 = CrossModalStructureGuidance(embed_dims[0])
-        self.cmsg2 = CrossModalStructureGuidance(embed_dims[1])
-        self.cmsg3 = CrossModalStructureGuidance(embed_dims[2])
-        self.cmsg4 = CrossModalStructureGuidance(embed_dims[3])
+        # self.cmsg1 = CrossModalStructureGuidance(embed_dims[0])
+        # self.cmsg2 = CrossModalStructureGuidance(embed_dims[1])
+        # self.cmsg3 = CrossModalStructureGuidance(embed_dims[2])
+        # self.cmsg4 = CrossModalStructureGuidance(embed_dims[3])
         
         # self.uaf1 = UncertaintyAwareFusion(embed_dims[0])
         # self.uaf2 = UncertaintyAwareFusion(embed_dims[1])
         # self.uaf3 = UncertaintyAwareFusion(embed_dims[2])
         # self.uaf4 = UncertaintyAwareFusion(embed_dims[3])
+
+        self.vis_done = False
+
         # transformer encoder blocks
         dpr = [x.item() for x in torch.linspace(0, drop_path_rate, sum(depths))]
         cur = 0
@@ -339,6 +456,37 @@ class RGBXTransformer(nn.Module):
 
         self.apply(self._init_weights)
 
+    def fusion_loss(self, rgb, dsm):
+        """
+        计算结合ACFM, CMSG, UAF的损失。
+        输出两个标量：L_cons, low_L_cons
+        """
+        # 1. 获取ACFM增强特征
+        acfm_feat = self.acfm4(rgb, dsm)
+
+        # 2. 获取CMSG增强特征
+        cmsg_feat = self.cmsg4(rgb, dsm)
+
+        # 3. 获取UAF融合特征
+        uaf_feat = self.uaf4(rgb, dsm)
+
+        # 简单设计：使用L1损失衡量各特征之间的一致性
+        loss_acfm_uaf = F.l1_loss(acfm_feat, uaf_feat)
+        loss_cmsg_uaf = F.l1_loss(cmsg_feat, uaf_feat)
+
+        # 合并作为 L_cons
+        L_cons = loss_acfm_uaf + loss_cmsg_uaf
+
+        # low_L_cons 可以用低频信息损失（ACFM低频与高频分离）
+        # 取ACFM的低频 mask
+        B, C, H, W = rgb.shape
+        low_mask = self.acfm4._build_low_mask(H, W, rgb.device, rgb.dtype)
+        low_freq_rgb = rgb * low_mask
+        low_freq_dsm = dsm * low_mask
+        low_L_cons = F.mse_loss(low_freq_rgb, low_freq_dsm)
+
+        return L_cons, low_L_cons
+
     def _init_weights(self, m):
         if isinstance(m, nn.Linear):
             trunc_normal_(m.weight, std=.02)
@@ -375,7 +523,7 @@ class RGBXTransformer(nn.Module):
         x_e = self.extra_norm1(x_e)
         x_rgb = x_rgb.reshape(B, H, W, -1).permute(0, 3, 1, 2).contiguous()
         x_e = x_e.reshape(B, H, W, -1).permute(0, 3, 1, 2).contiguous()
-        x_rgb = self.cmsg1(x_rgb, x_e)
+        # x_rgb = self.cmsg1(x_rgb, x_e)
 
         # outs_semantic.append(self.uaf1(x_rgb, x_e))
 
@@ -397,7 +545,7 @@ class RGBXTransformer(nn.Module):
         x_e = self.extra_norm2(x_e)
         x_rgb = x_rgb.reshape(B, H, W, -1).permute(0, 3, 1, 2).contiguous()
         x_e = x_e.reshape(B, H, W, -1).permute(0, 3, 1, 2).contiguous()
-        x_rgb = self.cmsg2(x_rgb, x_e)
+        # x_rgb = self.cmsg2(x_rgb, x_e)
         # outs_semantic.append(self.uaf2(x_rgb, x_e))
 
         # fused = self.uaf2(x_rgb, x_e)
@@ -418,7 +566,7 @@ class RGBXTransformer(nn.Module):
         x_e = self.extra_norm3(x_e)
         x_rgb = x_rgb.reshape(B, H, W, -1).permute(0, 3, 1, 2).contiguous()
         x_e = x_e.reshape(B, H, W, -1).permute(0, 3, 1, 2).contiguous()
-        x_rgb = self.cmsg3(x_rgb, x_e)
+        # x_rgb = self.cmsg3(x_rgb, x_e)
         # outs_semantic.append(self.uaf3(x_rgb, x_e))
 
         # fused = self.uaf3(x_rgb, x_e)
@@ -439,7 +587,19 @@ class RGBXTransformer(nn.Module):
         x_e = self.extra_norm4(x_e)
         x_rgb = x_rgb.reshape(B, H, W, -1).permute(0, 3, 1, 2).contiguous()
         x_e = x_e.reshape(B, H, W, -1).permute(0, 3, 1, 2).contiguous()
-        x_rgb = self.cmsg4(x_rgb, x_e)
+        # x_rgb = self.cmsg4(x_rgb, x_e)
+        # visualize_acfm_effect(x_rgb, x_e, self.acfm4)
+
+        # === 新增：运行可视化（只运行一次） ===
+        # if not self.vis_done:
+        #     # ACFM可视化（Stage4特征）
+        #     visualize_acfm_effect(x_rgb, x_e, self.acfm4)
+        #     # CMSG可视化（Stage4特征）
+        #     visualize_cmsg_effect(x_rgb, x_e, self.cmsg4)
+        #     # UAF可视化（Stage4特征）
+        #     visualize_uaf_effect(x_rgb, x_e, self.uaf4)
+        #     self.vis_done = True  # 标记完成，避免重复运行
+
         # x_rgb = self.acfm4(x_rgb, x_e)  # inject DSM freq info into RGB (stage4 only)
         
         # outs_semantic.append(self.uaf4(x_rgb, x_e))
@@ -451,24 +611,30 @@ class RGBXTransformer(nn.Module):
         outs_semantic.append(self.fuse4(x_rgb, x_e))
 
 
-        # keep interface: return (outs, MIloss, low_MIloss)
+        # keep interface: return (outs, L_cons, low_L_cons)
         # device = outs_semantic[-1].device
-        # MIloss = torch.zeros([], device=device)
-        # low_MIloss = torch.zeros([], device=device)
-        # return outs_semantic, MIloss, low_MIloss
+        # L_cons = torch.zeros([], device=device)
+        # low_L_cons = torch.zeros([], device=device)
+        # return outs_semantic, L_cons, low_L_cons
         last = outs_semantic[-1]
         if isinstance(last, (tuple, list)):
             last = last[0]
         device = last.device
 
         # 建议用 shape [1]，避免 DataParallel gather scalar 警告
-        MIloss = last.new_zeros(1)
-        low_MIloss = last.new_zeros(1)
-        return outs_semantic, MIloss, low_MIloss
+        L_cons = last.new_zeros(1)
+        low_L_cons = last.new_zeros(1)
+        return outs_semantic, L_cons, low_L_cons
 
     def forward(self, x_rgb, x_e):
-        out_semantic, MIloss, low_MIloss = self.forward_features(x_rgb, x_e)
-        return out_semantic, MIloss, low_MIloss
+        out_semantic, L_cons, low_L_cons = self.forward_features(x_rgb, x_e)
+        return out_semantic, L_cons, low_L_cons
+        # last = out_semantic[-1]
+        # if isinstance(last, (tuple, list)):
+        #     last = last[0]
+
+        # L_cons, low_L_cons = self.fusion_loss(last, last)  # 这里可以传当前RGB和DSM
+        # return out_semantic, L_cons, low_L_cons
 
 
 def load_dualpath_model(model, model_file, in_chans):

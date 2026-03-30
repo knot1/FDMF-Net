@@ -143,11 +143,11 @@ def train(dataset_cfg, training_cfg, model, optimizer, scheduler, train_loader, 
             opt, dsm, target = opt.cuda(), dsm.cuda(), target.cuda()
             optimizer.zero_grad()
 
-            output, MIloss, low_MIloss = model(opt, dsm)
+            output, L_cons, low_L_cons = model(opt, dsm)
             loss_ce = CrossEntropy2d(output, target, weight=weights)
             loss_dice = dice_loss(output, target)
             
-            loss = loss_ce + (MIloss * training_cfg.alpha) - (low_MIloss * training_cfg.beta) + (loss_dice * training_cfg.gamma)
+            loss = loss_ce + (L_cons * training_cfg.alpha) - (low_L_cons * training_cfg.beta) + (loss_dice * training_cfg.gamma)
             loss.backward()
             optimizer.step()
 

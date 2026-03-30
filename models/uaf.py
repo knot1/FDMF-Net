@@ -4,7 +4,7 @@ import torch.nn.functional as F
 
 
 class UncertaintyAwareFusion(nn.Module):
-    def __init__(self, channels: int, reduction: int = 4, temperature: float = 2.0):
+    def __init__(self, channels: int, reduction: int = 4, temperature: float = 1.5):
         super().__init__()
         mid = max(8, channels // reduction)
         self.temperature = temperature

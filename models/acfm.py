@@ -2,7 +2,6 @@ import torch
 import torch.nn as nn
 import torch_dct as DCT
 
-
 class AdaptiveCrossFrequencyModule(nn.Module):
     """
     Stage-4 recommended (small H,W) due to O(N^2) attention.
@@ -93,7 +92,6 @@ class AdaptiveCrossFrequencyModule(nn.Module):
     def forward(self, rgb: torch.Tensor, dsm: torch.Tensor):
         rgb = self.rgb_proj(rgb)
         dsm = self.dsm_proj(dsm)
-
         rgb_freq = self.freq_transform(rgb)
         dsm_freq = self.freq_transform(dsm)
 

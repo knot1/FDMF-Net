@@ -18,6 +18,9 @@ figs/
 *.pth
 *.pt
 *.log
+*Baseline**/
+*equalitative_results/
+*vis_results/
 
 # 系统临时文件
 *.swp
