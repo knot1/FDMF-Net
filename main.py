@@ -17,6 +17,42 @@ logging.captureWarnings(True)
 logger = logging.getLogger(__name__)
 
 
+from collections import defaultdict
+
+def list_caf_modules_params(model):
+    """
+    列出 CAF-Net 的各个小模块（ACFM / CMSG / UAF）参数
+    """
+    caf_keywords = ["acfm", "cmsg", "uaf"]
+    total_params = 0
+    caf_params = defaultdict(int)
+
+    for name, param in model.named_parameters():
+        n = param.numel()
+        total_params += n
+
+        for key in caf_keywords:
+            if key in name.lower():
+                caf_params[name] = n
+
+    print("\n" + "="*70)
+    print("CAF-Net Small Modules Parameter Statistics")
+    print("="*70)
+    if not caf_params:
+        print("No CAF modules detected or modules have no learnable parameters.")
+    else:
+        for k, v in sorted(caf_params.items(), key=lambda x: x[1], reverse=True):
+            print(f"{k:<60} {v:>10,d} params")
+    print("-"*70)
+    print(f"Total model parameters        : {total_params:,}")
+    print(f"Total CAF module parameters   : {sum(caf_params.values()):,}")
+    print("="*70)
+
+
+# 用法示例：
+# model = CAFNet(...)  # 你的 CAF-Net 模型实例
+# list_caf_modules_params(model)
+
 @hydra.main(config_path=".", config_name="config", version_base=None)
 def main(cfg: DictConfig):
     fix_random_seed(cfg.seed)
@@ -51,6 +87,7 @@ def main(cfg: DictConfig):
         model = Baseline(cfg=model_cfg, num_classes=N_CLASSES, in_chans=[4, 1])
     elif cfg.training_dataset == 'Vaihingen':
         model = Baseline(cfg=model_cfg, num_classes=N_CLASSES, in_chans=[3, 1])
+        list_caf_modules_params(model)
     elif cfg.training_dataset == 'YESeg':
         model = Baseline(cfg=model_cfg, num_classes=N_CLASSES, in_chans=[3, 3])
     else:

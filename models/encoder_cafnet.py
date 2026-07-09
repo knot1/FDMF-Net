@@ -1,13 +1,9 @@
 import math
 import time
 from functools import partial
-import os
-
-import matplotlib.pyplot as plt
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import torch_dct as DCT
 from timm.models.layers import DropPath, to_2tuple, trunc_normal_
 
 from .acfm import AdaptiveCrossFrequencyModule
@@ -15,118 +11,12 @@ from .cmsg import CrossModalStructureGuidance
 from .uaf import UncertaintyAwareFusion
 
 
-# =========================
-# Visualization helpers
-# =========================
-def visualize_acfm_effect(rgb, dsm, acfm_module, save_dir="./vis_results"):
-    os.makedirs(save_dir, exist_ok=True)
-
-    freq_rgb_ori = DCT.dct_2d(rgb, norm='ortho')
-    freq_dsm_ori = DCT.dct_2d(dsm, norm='ortho')
-    amp_diff_ori = torch.abs(freq_rgb_ori - freq_dsm_ori).mean(dim=1, keepdim=True)
-
-    rgb_freq = acfm_module.freq_transform(rgb)
-    dsm_freq = acfm_module.freq_transform(dsm)
-    freq_rgb_new = DCT.dct_2d(rgb_freq, norm='ortho')
-    freq_dsm_new = DCT.dct_2d(dsm_freq, norm='ortho')
-    amp_diff_new = torch.abs(freq_rgb_new - freq_dsm_new).mean(dim=1, keepdim=True)
-
-    g = torch.sigmoid(acfm_module.gate(rgb))
-    g_low = g[:, 0].mean().item()
-    g_high = g[:, 1].mean().item()
-
-    plt.figure(figsize=(10, 4))
-    plt.subplot(1, 2, 1)
-    plt.imshow(amp_diff_ori[0, 0].detach().cpu().numpy(), cmap='viridis')
-    plt.title(f"Before ACFM (g_low={g_low:.2f}, g_high={g_high:.2f})")
-    plt.axis('off')
-
-    plt.subplot(1, 2, 2)
-    plt.imshow(amp_diff_new[0, 0].detach().cpu().numpy(), cmap='viridis')
-    plt.title("After ACFM")
-    plt.axis('off')
-
-    plt.savefig(os.path.join(save_dir, "acfm_amp_diff.png"), dpi=300, bbox_inches='tight')
-    plt.close()
-
-
-def visualize_cmsg_effect(rgb, dsm, cmsg_module, save_dir="./vis_results"):
-    os.makedirs(save_dir, exist_ok=True)
-
-    blur = cmsg_module.dsm_blur(dsm)
-    structure = dsm - blur
-    structure_refine = cmsg_module.structure_refine(structure)
-    a = cmsg_module.attn(torch.cat([rgb, structure_refine], dim=1))
-    guided_rgb = rgb + rgb * a
-
-    plt.figure(figsize=(12, 3))
-    plt.subplot(1, 4, 1)
-    plt.imshow(dsm[0, 0].detach().cpu().numpy(), cmap='gray')
-    plt.title("DSM Original")
-    plt.axis('off')
-
-    plt.subplot(1, 4, 2)
-    plt.imshow(structure_refine[0, 0].detach().cpu().numpy(), cmap='gray')
-    plt.title("DSM High-pass Structure")
-    plt.axis('off')
-
-    plt.subplot(1, 4, 3)
-    plt.imshow(a[0, 0].detach().cpu().numpy(), cmap='jet')
-    plt.title("CMSG Attention")
-    plt.axis('off')
-
-    plt.subplot(1, 4, 4)
-    plt.imshow(guided_rgb[0, 0].detach().cpu().numpy(), cmap='gray')
-    plt.title("Guided RGB")
-    plt.axis('off')
-
-    plt.savefig(os.path.join(save_dir, "cmsg_structure.png"), dpi=300, bbox_inches='tight')
-    plt.close()
-
-
-def visualize_uaf_effect(rgb, dsm, uaf_module, save_dir="./vis_results"):
-    os.makedirs(save_dir, exist_ok=True)
-
-    rgb_score = uaf_module.rgb_conf(rgb)
-    dsm_score = uaf_module.dsm_conf(dsm)
-    scores = torch.cat([rgb_score, dsm_score], dim=1)
-    weights = F.softmax(scores / uaf_module.temperature, dim=1)
-    w_rgb = weights[:, 0:1]
-    w_dsm = weights[:, 1:2]
-    fusion = w_rgb * rgb + w_dsm * dsm
-
-    plt.figure(figsize=(12, 3))
-    plt.subplot(1, 4, 1)
-    plt.imshow(w_rgb[0, 0].detach().cpu().numpy(), cmap='jet')
-    plt.title("RGB Weight")
-    plt.axis('off')
-
-    plt.subplot(1, 4, 2)
-    plt.imshow(w_dsm[0, 0].detach().cpu().numpy(), cmap='jet')
-    plt.title("DSM Weight")
-    plt.axis('off')
-
-    plt.subplot(1, 4, 3)
-    plt.imshow(rgb[0, 0].detach().cpu().numpy(), cmap='gray')
-    plt.title("RGB")
-    plt.axis('off')
-
-    plt.subplot(1, 4, 4)
-    plt.imshow(fusion[0, 0].detach().cpu().numpy(), cmap='gray')
-    plt.title("Fusion")
-    plt.axis('off')
-
-    plt.savefig(os.path.join(save_dir, "uaf_confidence.png"), dpi=300, bbox_inches='tight')
-    plt.close()
-
-
-# =========================
-# Backbone blocks
-# =========================
 class DWConv(nn.Module):
     def __init__(self, dim=768):
         super().__init__()
-        self.dwconv = nn.Conv2d(dim, dim, kernel_size=3, stride=1, padding=1, bias=True, groups=dim)
+        self.dwconv = nn.Conv2d(
+            dim, dim, kernel_size=3, stride=1, padding=1, bias=True, groups=dim
+        )
 
     def forward(self, x, H, W):
         B, N, C = x.shape
@@ -137,7 +27,8 @@ class DWConv(nn.Module):
 
 
 class Mlp(nn.Module):
-    def __init__(self, in_features, hidden_features=None, out_features=None, act_layer=nn.GELU, drop=0.):
+    def __init__(self, in_features, hidden_features=None, out_features=None,
+                 act_layer=nn.GELU, drop=0.0):
         super().__init__()
         out_features = out_features or in_features
         hidden_features = hidden_features or in_features
@@ -152,7 +43,7 @@ class Mlp(nn.Module):
 
     def _init_weights(self, m):
         if isinstance(m, nn.Linear):
-            trunc_normal_(m.weight, std=.02)
+            trunc_normal_(m.weight, std=0.02)
             if m.bias is not None:
                 nn.init.constant_(m.bias, 0)
         elif isinstance(m, nn.LayerNorm):
@@ -177,9 +68,9 @@ class Mlp(nn.Module):
 
 class Attention(nn.Module):
     def __init__(self, dim, num_heads=8, qkv_bias=False, qk_scale=None,
-                 attn_drop=0., proj_drop=0., sr_ratio=1):
+                 attn_drop=0.0, proj_drop=0.0, sr_ratio=1):
         super().__init__()
-        assert dim % num_heads == 0
+        assert dim % num_heads == 0, f"dim {dim} should be divided by num_heads {num_heads}"
 
         self.dim = dim
         self.num_heads = num_heads
@@ -201,7 +92,7 @@ class Attention(nn.Module):
 
     def _init_weights(self, m):
         if isinstance(m, nn.Linear):
-            trunc_normal_(m.weight, std=.02)
+            trunc_normal_(m.weight, std=0.02)
             if m.bias is not None:
                 nn.init.constant_(m.bias, 0)
         elif isinstance(m, nn.LayerNorm):
@@ -227,6 +118,7 @@ class Attention(nn.Module):
             kv = self.kv(x).reshape(B, -1, 2, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
 
         k, v = kv[0], kv[1]
+
         attn = (q @ k.transpose(-2, -1)) * self.scale
         attn = attn.softmax(dim=-1)
         attn = self.attn_drop(attn)
@@ -238,24 +130,34 @@ class Attention(nn.Module):
 
 
 class Block(nn.Module):
-    def __init__(self, dim, num_heads, mlp_ratio=4., qkv_bias=False, qk_scale=None,
-                 drop=0., attn_drop=0., drop_path=0., act_layer=nn.GELU,
+    def __init__(self, dim, num_heads, mlp_ratio=4.0, qkv_bias=False, qk_scale=None,
+                 drop=0.0, attn_drop=0.0, drop_path=0.0, act_layer=nn.GELU,
                  norm_layer=nn.LayerNorm, sr_ratio=1):
         super().__init__()
         self.norm1 = norm_layer(dim)
         self.attn = Attention(
-            dim, num_heads=num_heads, qkv_bias=qkv_bias, qk_scale=qk_scale,
-            attn_drop=attn_drop, proj_drop=drop, sr_ratio=sr_ratio
+            dim,
+            num_heads=num_heads,
+            qkv_bias=qkv_bias,
+            qk_scale=qk_scale,
+            attn_drop=attn_drop,
+            proj_drop=drop,
+            sr_ratio=sr_ratio,
         )
-        self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
+        self.drop_path = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
         self.norm2 = norm_layer(dim)
-        self.mlp = Mlp(in_features=dim, hidden_features=int(dim * mlp_ratio), act_layer=act_layer, drop=drop)
+        self.mlp = Mlp(
+            in_features=dim,
+            hidden_features=int(dim * mlp_ratio),
+            act_layer=act_layer,
+            drop=drop,
+        )
 
         self.apply(self._init_weights)
 
     def _init_weights(self, m):
         if isinstance(m, nn.Linear):
-            trunc_normal_(m.weight, std=.02)
+            trunc_normal_(m.weight, std=0.02)
             if m.bias is not None:
                 nn.init.constant_(m.bias, 0)
         elif isinstance(m, nn.LayerNorm):
@@ -290,7 +192,7 @@ class OverlapPatchEmbed(nn.Module):
 
     def _init_weights(self, m):
         if isinstance(m, nn.Linear):
-            trunc_normal_(m.weight, std=.02)
+            trunc_normal_(m.weight, std=0.02)
             if m.bias is not None:
                 nn.init.constant_(m.bias, 0)
         elif isinstance(m, nn.LayerNorm):
@@ -311,67 +213,74 @@ class OverlapPatchEmbed(nn.Module):
         return x, H, W
 
 
-class SimpleFusion(nn.Module):
-    def __init__(self, c: int):
-        super().__init__()
-        self.proj = nn.Sequential(
-            nn.Conv2d(c * 2, c, kernel_size=1, bias=False),
-            nn.BatchNorm2d(c),
-            nn.ReLU(inplace=True),
-        )
-
-    def forward(self, x_rgb: torch.Tensor, x_e: torch.Tensor) -> torch.Tensor:
-        x = torch.cat([x_rgb, x_e], dim=1)
-        return self.proj(x)
-
-
-# =========================
-# Main backbone with switches
-# =========================
 class RGBXTransformer(nn.Module):
-    def __init__(self, img_size=256, patch_size=16, in_chans=None, num_classes=1000,
-                 embed_dims=[64, 128, 256, 512], num_heads=[1, 2, 4, 8],
-                 mlp_ratios=[4, 4, 4, 4], qkv_bias=False, qk_scale=None,
-                 drop_rate=0., attn_drop_rate=0., drop_path_rate=0.,
-                 norm_layer=nn.LayerNorm, norm_fuse=nn.BatchNorm2d,
-                 depths=[3, 4, 6, 3], sr_ratios=[8, 4, 2, 1],
-                 use_cmsg=True, use_acfm=True, use_uaf=True):
+    def __init__(
+    self,
+    img_size=256,
+    patch_size=16,
+    in_chans=None,
+    num_classes=1000,
+    embed_dims=[64, 128, 256, 512],
+    num_heads=[1, 2, 4, 8],
+    mlp_ratios=[4, 4, 4, 4],
+    qkv_bias=False,
+    qk_scale=None,
+    drop_rate=0.0,
+    attn_drop_rate=0.0,
+    drop_path_rate=0.0,
+    norm_layer=nn.LayerNorm,
+    norm_fuse=nn.BatchNorm2d,
+    depths=[3, 4, 6, 3],
+    sr_ratios=[8, 4, 2, 1],
+):
         super().__init__()
-        
+
         if in_chans is None:
             raise ValueError("in_chans should not be None")
-        
+
+        self.num_classes = num_classes
+        self.depths = depths
         self.in_chans = in_chans
-        self.use_cmsg = use_cmsg
-        self.use_acfm = use_acfm
-        self.use_uaf = use_uaf
 
         self.debug_info = {}
-        self.vis_done = False
-        self.add_noise = False
-        self.drop_dsm = False
 
         # RGB branch
-        self.patch_embed1 = OverlapPatchEmbed(img_size=img_size, patch_size=7, stride=4,
-                                              in_chans=self.in_chans[0], embed_dim=embed_dims[0])
-        self.patch_embed2 = OverlapPatchEmbed(img_size=img_size // 4, patch_size=3, stride=2,
-                                              in_chans=embed_dims[0], embed_dim=embed_dims[1])
-        self.patch_embed3 = OverlapPatchEmbed(img_size=img_size // 8, patch_size=3, stride=2,
-                                              in_chans=embed_dims[1], embed_dim=embed_dims[2])
-        self.patch_embed4 = OverlapPatchEmbed(img_size=img_size // 16, patch_size=3, stride=2,
-                                              in_chans=embed_dims[2], embed_dim=embed_dims[3])
+        self.patch_embed1 = OverlapPatchEmbed(
+            img_size=img_size, patch_size=7, stride=4,
+            in_chans=self.in_chans[0], embed_dim=embed_dims[0]
+        )
+        self.patch_embed2 = OverlapPatchEmbed(
+            img_size=img_size // 4, patch_size=3, stride=2,
+            in_chans=embed_dims[0], embed_dim=embed_dims[1]
+        )
+        self.patch_embed3 = OverlapPatchEmbed(
+            img_size=img_size // 8, patch_size=3, stride=2,
+            in_chans=embed_dims[1], embed_dim=embed_dims[2]
+        )
+        self.patch_embed4 = OverlapPatchEmbed(
+            img_size=img_size // 16, patch_size=3, stride=2,
+            in_chans=embed_dims[2], embed_dim=embed_dims[3]
+        )
 
-        # DSM/extra branch
-        self.extra_patch_embed1 = OverlapPatchEmbed(img_size=img_size, patch_size=7, stride=4,
-                                                    in_chans=self.in_chans[1], embed_dim=embed_dims[0])
-        self.extra_patch_embed2 = OverlapPatchEmbed(img_size=img_size // 4, patch_size=3, stride=2,
-                                                    in_chans=embed_dims[0], embed_dim=embed_dims[1])
-        self.extra_patch_embed3 = OverlapPatchEmbed(img_size=img_size // 8, patch_size=3, stride=2,
-                                                    in_chans=embed_dims[1], embed_dim=embed_dims[2])
-        self.extra_patch_embed4 = OverlapPatchEmbed(img_size=img_size // 16, patch_size=3, stride=2,
-                                                    in_chans=embed_dims[2], embed_dim=embed_dims[3])
+        # DSM / extra branch
+        self.extra_patch_embed1 = OverlapPatchEmbed(
+            img_size=img_size, patch_size=7, stride=4,
+            in_chans=self.in_chans[1], embed_dim=embed_dims[0]
+        )
+        self.extra_patch_embed2 = OverlapPatchEmbed(
+            img_size=img_size // 4, patch_size=3, stride=2,
+            in_chans=embed_dims[0], embed_dim=embed_dims[1]
+        )
+        self.extra_patch_embed3 = OverlapPatchEmbed(
+            img_size=img_size // 8, patch_size=3, stride=2,
+            in_chans=embed_dims[1], embed_dim=embed_dims[2]
+        )
+        self.extra_patch_embed4 = OverlapPatchEmbed(
+            img_size=img_size // 16, patch_size=3, stride=2,
+            in_chans=embed_dims[2], embed_dim=embed_dims[3]
+        )
 
-        # modules
+        # CAF-Net modules
         self.acfm4 = AdaptiveCrossFrequencyModule(channels=embed_dims[3], low_radius=0.35)
 
         self.cmsg1 = CrossModalStructureGuidance(embed_dims[0])
@@ -384,93 +293,106 @@ class RGBXTransformer(nn.Module):
         self.uaf3 = UncertaintyAwareFusion(embed_dims[2])
         self.uaf4 = UncertaintyAwareFusion(embed_dims[3])
 
+        # transformer blocks
         dpr = [x.item() for x in torch.linspace(0, drop_path_rate, sum(depths))]
         cur = 0
 
-        self.block1 = nn.ModuleList([Block(
-            dim=embed_dims[0], num_heads=num_heads[0], mlp_ratio=mlp_ratios[0],
-            qkv_bias=qkv_bias, qk_scale=qk_scale, drop=drop_rate,
-            attn_drop=attn_drop_rate, drop_path=dpr[cur + i],
-            norm_layer=norm_layer, sr_ratio=sr_ratios[0])
-            for i in range(depths[0])])
+        self.block1 = nn.ModuleList([
+            Block(
+                dim=embed_dims[0], num_heads=num_heads[0], mlp_ratio=mlp_ratios[0],
+                qkv_bias=qkv_bias, qk_scale=qk_scale, drop=drop_rate,
+                attn_drop=attn_drop_rate, drop_path=dpr[cur + i],
+                norm_layer=norm_layer, sr_ratio=sr_ratios[0]
+            )
+            for i in range(depths[0])
+        ])
         self.norm1 = norm_layer(embed_dims[0])
 
-        self.extra_block1 = nn.ModuleList([Block(
-            dim=embed_dims[0], num_heads=num_heads[0], mlp_ratio=mlp_ratios[0],
-            qkv_bias=qkv_bias, qk_scale=qk_scale, drop=drop_rate,
-            attn_drop=attn_drop_rate, drop_path=dpr[cur + i],
-            norm_layer=norm_layer, sr_ratio=sr_ratios[0])
-            for i in range(depths[0])])
+        self.extra_block1 = nn.ModuleList([
+            Block(
+                dim=embed_dims[0], num_heads=num_heads[0], mlp_ratio=mlp_ratios[0],
+                qkv_bias=qkv_bias, qk_scale=qk_scale, drop=drop_rate,
+                attn_drop=attn_drop_rate, drop_path=dpr[cur + i],
+                norm_layer=norm_layer, sr_ratio=sr_ratios[0]
+            )
+            for i in range(depths[0])
+        ])
         self.extra_norm1 = norm_layer(embed_dims[0])
         cur += depths[0]
 
-        self.block2 = nn.ModuleList([Block(
-            dim=embed_dims[1], num_heads=num_heads[1], mlp_ratio=mlp_ratios[1],
-            qkv_bias=qkv_bias, qk_scale=qk_scale, drop=drop_rate,
-            attn_drop=attn_drop_rate, drop_path=dpr[cur + i],
-            norm_layer=norm_layer, sr_ratio=sr_ratios[1])
-            for i in range(depths[1])])
+        self.block2 = nn.ModuleList([
+            Block(
+                dim=embed_dims[1], num_heads=num_heads[1], mlp_ratio=mlp_ratios[1],
+                qkv_bias=qkv_bias, qk_scale=qk_scale, drop=drop_rate,
+                attn_drop=attn_drop_rate, drop_path=dpr[cur + i],
+                norm_layer=norm_layer, sr_ratio=sr_ratios[1]
+            )
+            for i in range(depths[1])
+        ])
         self.norm2 = norm_layer(embed_dims[1])
 
-        self.extra_block2 = nn.ModuleList([Block(
-            dim=embed_dims[1], num_heads=num_heads[1], mlp_ratio=mlp_ratios[1],
-            qkv_bias=qkv_bias, qk_scale=qk_scale, drop=drop_rate,
-            attn_drop=attn_drop_rate, drop_path=dpr[cur + i],
-            norm_layer=norm_layer, sr_ratio=sr_ratios[1])
-            for i in range(depths[1])])
+        self.extra_block2 = nn.ModuleList([
+            Block(
+                dim=embed_dims[1], num_heads=num_heads[1], mlp_ratio=mlp_ratios[1],
+                qkv_bias=qkv_bias, qk_scale=qk_scale, drop=drop_rate,
+                attn_drop=attn_drop_rate, drop_path=dpr[cur + i],
+                norm_layer=norm_layer, sr_ratio=sr_ratios[1]
+            )
+            for i in range(depths[1])
+        ])
         self.extra_norm2 = norm_layer(embed_dims[1])
         cur += depths[1]
 
-        self.block3 = nn.ModuleList([Block(
-            dim=embed_dims[2], num_heads=num_heads[2], mlp_ratio=mlp_ratios[2],
-            qkv_bias=qkv_bias, qk_scale=qk_scale, drop=drop_rate,
-            attn_drop=attn_drop_rate, drop_path=dpr[cur + i],
-            norm_layer=norm_layer, sr_ratio=sr_ratios[2])
-            for i in range(depths[2])])
+        self.block3 = nn.ModuleList([
+            Block(
+                dim=embed_dims[2], num_heads=num_heads[2], mlp_ratio=mlp_ratios[2],
+                qkv_bias=qkv_bias, qk_scale=qk_scale, drop=drop_rate,
+                attn_drop=attn_drop_rate, drop_path=dpr[cur + i],
+                norm_layer=norm_layer, sr_ratio=sr_ratios[2]
+            )
+            for i in range(depths[2])
+        ])
         self.norm3 = norm_layer(embed_dims[2])
 
-        self.extra_block3 = nn.ModuleList([Block(
-            dim=embed_dims[2], num_heads=num_heads[2], mlp_ratio=mlp_ratios[2],
-            qkv_bias=qkv_bias, qk_scale=qk_scale, drop=drop_rate,
-            attn_drop=attn_drop_rate, drop_path=dpr[cur + i],
-            norm_layer=norm_layer, sr_ratio=sr_ratios[2])
-            for i in range(depths[2])])
+        self.extra_block3 = nn.ModuleList([
+            Block(
+                dim=embed_dims[2], num_heads=num_heads[2], mlp_ratio=mlp_ratios[2],
+                qkv_bias=qkv_bias, qk_scale=qk_scale, drop=drop_rate,
+                attn_drop=attn_drop_rate, drop_path=dpr[cur + i],
+                norm_layer=norm_layer, sr_ratio=sr_ratios[2]
+            )
+            for i in range(depths[2])
+        ])
         self.extra_norm3 = norm_layer(embed_dims[2])
         cur += depths[2]
 
-        self.block4 = nn.ModuleList([Block(
-            dim=embed_dims[3], num_heads=num_heads[3], mlp_ratio=mlp_ratios[3],
-            qkv_bias=qkv_bias, qk_scale=qk_scale, drop=drop_rate,
-            attn_drop=attn_drop_rate, drop_path=dpr[cur + i],
-            norm_layer=norm_layer, sr_ratio=sr_ratios[3])
-            for i in range(depths[3])])
+        self.block4 = nn.ModuleList([
+            Block(
+                dim=embed_dims[3], num_heads=num_heads[3], mlp_ratio=mlp_ratios[3],
+                qkv_bias=qkv_bias, qk_scale=qk_scale, drop=drop_rate,
+                attn_drop=attn_drop_rate, drop_path=dpr[cur + i],
+                norm_layer=norm_layer, sr_ratio=sr_ratios[3]
+            )
+            for i in range(depths[3])
+        ])
         self.norm4 = norm_layer(embed_dims[3])
 
-        self.extra_block4 = nn.ModuleList([Block(
-            dim=embed_dims[3], num_heads=num_heads[3], mlp_ratio=mlp_ratios[3],
-            qkv_bias=qkv_bias, qk_scale=qk_scale, drop=drop_rate,
-            attn_drop=attn_drop_rate, drop_path=dpr[cur + i],
-            norm_layer=norm_layer, sr_ratio=sr_ratios[3])
-            for i in range(depths[3])])
+        self.extra_block4 = nn.ModuleList([
+            Block(
+                dim=embed_dims[3], num_heads=num_heads[3], mlp_ratio=mlp_ratios[3],
+                qkv_bias=qkv_bias, qk_scale=qk_scale, drop=drop_rate,
+                attn_drop=attn_drop_rate, drop_path=dpr[cur + i],
+                norm_layer=norm_layer, sr_ratio=sr_ratios[3]
+            )
+            for i in range(depths[3])
+        ])
         self.extra_norm4 = norm_layer(embed_dims[3])
 
         self.apply(self._init_weights)
 
-    def fusion_loss(self, f_cmsg, f_acfm, f_uaf, rgb_feat, dsm_feat):
-        loss_acfm_uaf = F.l1_loss(f_acfm, f_uaf)
-        loss_cmsg_uaf = F.l1_loss(f_cmsg, f_uaf)
-        L_cons = loss_acfm_uaf + loss_cmsg_uaf
-
-        _, _, H, W = rgb_feat.shape
-        low_mask = self.acfm4._build_low_mask(H, W, rgb_feat.device, rgb_feat.dtype)
-        low_freq_rgb = rgb_feat * low_mask
-        low_freq_dsm = dsm_feat * low_mask
-        low_L_cons = F.mse_loss(low_freq_rgb, low_freq_dsm)
-        return L_cons, low_L_cons
-
     def _init_weights(self, m):
         if isinstance(m, nn.Linear):
-            trunc_normal_(m.weight, std=.02)
+            trunc_normal_(m.weight, std=0.02)
             if m.bias is not None:
                 nn.init.constant_(m.bias, 0)
         elif isinstance(m, nn.LayerNorm):
@@ -487,84 +409,100 @@ class RGBXTransformer(nn.Module):
         if isinstance(pretrained, str):
             load_dualpath_model(self, pretrained, self.in_chans)
         else:
-            raise TypeError('pretrained must be a str or None')
+            raise TypeError("pretrained must be a str or None")
 
-    def _apply_cmsg(self, cmsg_module, rgb_feat, dsm_feat):
-        if self.use_cmsg:
-            return cmsg_module(rgb_feat, dsm_feat)
-        return rgb_feat
+    def _uaf_forward(self, uaf_module, rgb_feat, dsm_feat):
+        out = uaf_module(rgb_feat, dsm_feat)
+        if isinstance(out, (tuple, list)):
+            if len(out) == 3:
+                fused, w_rgb, w_dsm = out
+            elif len(out) == 2:
+                fused, w_rgb = out
+                w_dsm = None
+            else:
+                fused = out[0]
+                w_rgb, w_dsm = None, None
+        else:
+            fused = out
+            w_rgb, w_dsm = None, None
+        return fused, w_rgb, w_dsm
 
-    def _apply_uaf(self, uaf_module, rgb_feat, dsm_feat):
-        if self.use_uaf:
-            fusion, w_rgb, w_dsm = uaf_module(
-                rgb_feat,
-                dsm_feat,
-                add_noise=self.add_noise,
-                drop_dsm=self.drop_dsm
-            )
-            return fusion, w_rgb, w_dsm
-        fusion = 0.5 * (rgb_feat + dsm_feat)
-        return fusion, None, None
+    def fusion_loss(self, f_cmsg, f_acfm, f_uaf, rgb_feat, dsm_feat):
+        loss_acfm_uaf = F.l1_loss(f_acfm, f_uaf)
+        loss_cmsg_uaf = F.l1_loss(f_cmsg, f_uaf)
+        L_cons = loss_acfm_uaf + loss_cmsg_uaf
+
+        _, _, H, W = rgb_feat.shape
+        low_mask = self.acfm4._build_low_mask(H, W, rgb_feat.device, rgb_feat.dtype)
+        low_freq_rgb = rgb_feat * low_mask
+        low_freq_dsm = dsm_feat * low_mask
+        low_L_cons = F.mse_loss(low_freq_rgb, low_freq_dsm)
+
+        return L_cons, low_L_cons
 
     def forward_features(self, x_rgb, x_e):
         B = x_rgb.shape[0]
         outs_semantic = []
 
-        # ========= Stage 1 =========
+        # Stage 1
         x_rgb, H, W = self.patch_embed1(x_rgb)
         x_e, _, _ = self.extra_patch_embed1(x_e)
         for blk in self.block1:
             x_rgb = blk(x_rgb, H, W)
         for blk in self.extra_block1:
             x_e = blk(x_e, H, W)
+
         x_rgb = self.norm1(x_rgb)
         x_e = self.extra_norm1(x_e)
         x_rgb = x_rgb.reshape(B, H, W, -1).permute(0, 3, 1, 2).contiguous()
         x_e = x_e.reshape(B, H, W, -1).permute(0, 3, 1, 2).contiguous()
 
-        x_rgb = self._apply_cmsg(self.cmsg1, x_rgb, x_e)
-        f1, _, _ = self._apply_uaf(self.uaf1, x_rgb, x_e)
+        x_rgb = self.cmsg1(x_rgb, x_e)
+        f1, _, _ = self._uaf_forward(self.uaf1, x_rgb, x_e)
         outs_semantic.append(f1)
 
-        # ========= Stage 2 =========
+        # Stage 2
         x_rgb, H, W = self.patch_embed2(f1)
         x_e, _, _ = self.extra_patch_embed2(x_e)
         for blk in self.block2:
             x_rgb = blk(x_rgb, H, W)
         for blk in self.extra_block2:
             x_e = blk(x_e, H, W)
+
         x_rgb = self.norm2(x_rgb)
         x_e = self.extra_norm2(x_e)
         x_rgb = x_rgb.reshape(B, H, W, -1).permute(0, 3, 1, 2).contiguous()
         x_e = x_e.reshape(B, H, W, -1).permute(0, 3, 1, 2).contiguous()
 
-        x_rgb = self._apply_cmsg(self.cmsg2, x_rgb, x_e)
-        f2, _, _ = self._apply_uaf(self.uaf2, x_rgb, x_e)
+        x_rgb = self.cmsg2(x_rgb, x_e)
+        f2, _, _ = self._uaf_forward(self.uaf2, x_rgb, x_e)
         outs_semantic.append(f2)
 
-        # ========= Stage 3 =========
+        # Stage 3
         x_rgb, H, W = self.patch_embed3(f2)
         x_e, _, _ = self.extra_patch_embed3(x_e)
         for blk in self.block3:
             x_rgb = blk(x_rgb, H, W)
         for blk in self.extra_block3:
             x_e = blk(x_e, H, W)
+
         x_rgb = self.norm3(x_rgb)
         x_e = self.extra_norm3(x_e)
         x_rgb = x_rgb.reshape(B, H, W, -1).permute(0, 3, 1, 2).contiguous()
         x_e = x_e.reshape(B, H, W, -1).permute(0, 3, 1, 2).contiguous()
 
-        x_rgb = self._apply_cmsg(self.cmsg3, x_rgb, x_e)
-        f3, _, _ = self._apply_uaf(self.uaf3, x_rgb, x_e)
+        x_rgb = self.cmsg3(x_rgb, x_e)
+        f3, _, _ = self._uaf_forward(self.uaf3, x_rgb, x_e)
         outs_semantic.append(f3)
 
-        # ========= Stage 4 =========
+        # Stage 4
         x_rgb, H, W = self.patch_embed4(f3)
         x_e, _, _ = self.extra_patch_embed4(x_e)
         for blk in self.block4:
             x_rgb = blk(x_rgb, H, W)
         for blk in self.extra_block4:
             x_e = blk(x_e, H, W)
+
         x_rgb = self.norm4(x_rgb)
         x_e = self.extra_norm4(x_e)
         x_rgb = x_rgb.reshape(B, H, W, -1).permute(0, 3, 1, 2).contiguous()
@@ -573,14 +511,9 @@ class RGBXTransformer(nn.Module):
         rgb_stage4 = x_rgb
         dsm_stage4 = x_e
 
-        f_cmsg = self._apply_cmsg(self.cmsg4, rgb_stage4, dsm_stage4)
-
-        if self.use_acfm:
-            f_acfm = self.acfm4(rgb_stage4, dsm_stage4)
-        else:
-            f_acfm = rgb_stage4
-
-        f_uaf, w_rgb, w_dsm = self._apply_uaf(self.uaf4, f_cmsg, dsm_stage4)
+        f_cmsg = self.cmsg4(rgb_stage4, dsm_stage4)
+        f_acfm = self.acfm4(rgb_stage4, dsm_stage4)
+        f_uaf, w_rgb, w_dsm = self._uaf_forward(self.uaf4, f_cmsg, dsm_stage4)
 
         outs_semantic.append(f_uaf)
 
@@ -594,24 +527,12 @@ class RGBXTransformer(nn.Module):
             "w_dsm": None if w_dsm is None else w_dsm.detach(),
         }
 
-        if not self.vis_done:
-            try:
-                if self.use_acfm:
-                    visualize_acfm_effect(rgb_stage4, dsm_stage4, self.acfm4)
-                if self.use_cmsg:
-                    visualize_cmsg_effect(rgb_stage4, dsm_stage4, self.cmsg4)
-                if self.use_uaf:
-                    visualize_uaf_effect(f_cmsg, dsm_stage4, self.uaf4)
-            except Exception as e:
-                print(f"[Warning] visualization failed: {e}")
-            self.vis_done = True
-
         L_cons, low_L_cons = self.fusion_loss(
             f_cmsg=f_cmsg,
             f_acfm=f_acfm,
             f_uaf=f_uaf,
             rgb_feat=rgb_stage4,
-            dsm_feat=dsm_stage4
+            dsm_feat=dsm_stage4,
         )
 
         return outs_semantic, L_cons.view(1), low_L_cons.view(1)
@@ -620,35 +541,33 @@ class RGBXTransformer(nn.Module):
         return self.forward_features(x_rgb, x_e)
 
 
-# =========================
-# pretrained loading
-# =========================
 def load_dualpath_model(model, model_file, in_chans):
     t0 = time.time()
+
     if isinstance(model_file, str):
-        raw_state_dict = torch.load(model_file, map_location=torch.device('cpu'))
-        if 'model' in raw_state_dict:
-            raw_state_dict = raw_state_dict['model']
+        raw_state_dict = torch.load(model_file, map_location=torch.device("cpu"))
+        if isinstance(raw_state_dict, dict) and "model" in raw_state_dict:
+            raw_state_dict = raw_state_dict["model"]
     else:
         raw_state_dict = model_file
 
     state_dict = {}
     for k, v in raw_state_dict.items():
-        if 'patch_embed' in k:
-            if 'patch_embed1.proj.weight' in k:
+        if "patch_embed" in k:
+            if "patch_embed1.proj.weight" in k:
                 rgb_v = _adapt_first_conv(v, in_chans[0])
                 extra_v = _adapt_first_conv(v, in_chans[1])
                 state_dict[k] = rgb_v
-                state_dict[k.replace('patch_embed1', 'extra_patch_embed1')] = extra_v
+                state_dict[k.replace("patch_embed1", "extra_patch_embed1")] = extra_v
             else:
                 state_dict[k] = v
-                state_dict[k.replace('patch_embed', 'extra_patch_embed')] = v
-        elif 'block' in k:
+                state_dict[k.replace("patch_embed", "extra_patch_embed")] = v
+        elif "block" in k:
             state_dict[k] = v
-            state_dict[k.replace('block', 'extra_block')] = v
-        elif 'norm' in k:
+            state_dict[k.replace("block", "extra_block")] = v
+        elif "norm" in k:
             state_dict[k] = v
-            state_dict[k.replace('norm', 'extra_norm')] = v
+            state_dict[k.replace("norm", "extra_norm")] = v
 
     t_io = time.time()
     msg = model.load_state_dict(state_dict, strict=False)
@@ -667,6 +586,7 @@ def load_dualpath_model(model, model_file, in_chans):
 def _adapt_first_conv(weight, in_chans: int):
     if weight.shape[1] == in_chans:
         return weight
+
     if in_chans < 3:
         new_weight = weight.mean(dim=1, keepdim=True).repeat(1, in_chans, 1, 1)
     else:
@@ -675,9 +595,6 @@ def _adapt_first_conv(weight, in_chans: int):
     return new_weight
 
 
-# =========================
-# variants
-# =========================
 class mit_b0(RGBXTransformer):
     def __init__(self, in_chans, fuse_cfg=None, **kwargs):
         super().__init__(
